@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "conventer"
+version = "0.1.0"
+description = ""
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+fastapi = "^0.110.0"
+unicorn = "^2.0.1.post1"
+uvicorn = "^0.28.0"
+celery = "^5.3.6"
+redis = "^5.0.3"
+flower = "^2.0.1"
+python-multipart = "^0.0.9"
+aiofiles = "^23.2.1"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
