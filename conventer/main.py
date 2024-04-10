@@ -21,12 +21,13 @@ celery: Celery = Celery(
 
 ROOTDIR: str = os.path.dirname(os.path.abspath(__file__))
 TMPDIR: str = os.path.join(ROOTDIR, 'tmp')
+SUPPORTED_FORMATS = ['mp4', 'avi', 'mkv', 'mov', 'webm', 'flv', 'wmv', 'ogv', '3gp', '3g2', 'hevc', 'av1', 'vro']
 
 class DirectoryRequest(BaseModel):
     directory: str
 
-def convert_vro_to_mp4(input_file, output_dir):
-    output_file = os.path.splitext(os.path.basename(input_file))[0] + '_converted.mp4'
+def convert_video(input_file, output_dir, output_format='mp4'):
+    output_file = os.path.splitext(os.path.basename(input_file))[0] + f'_converted.{output_format}'
     output_path = os.path.join(output_dir, output_file)
     command = ['ffmpeg', '-i', input_file, '-c:v', 'copy', '-c:a', 'aac', '-strict', 'experimental', output_path]
     result = subprocess.Popen(command, stdout=subprocess.PIPE)
@@ -37,15 +38,17 @@ def convert_vro_to_mp4(input_file, output_dir):
         return output_file
 
 @celery.task
-def convert_video_task(file_path, output_dir):
-    return convert_vro_to_mp4(file_path, output_dir)
+def convert_video_task(file_path, output_dir, output_format='mp4'):
+    return convert_video(file_path, output_dir, output_format)
 
 @celery.task
 def delete_files_task(directory_path):
     shutil.rmtree(directory_path)
 
 @app.post("/convert-video/")
-async def start_conversion(file: UploadFile = File(...)) -> str:
+async def start_conversion(file: UploadFile = File(...), output_format: str = 'mp4') -> str:
+    if output_format not in SUPPORTED_FORMATS:
+        raise HTTPException(status_code=400, detail=f"Неподдерживаемый формат. Доступные форматы: {', '.join(SUPPORTED_FORMATS)}")
     os.makedirs(TMPDIR, exist_ok=True)
     uuid_dir = os.path.join(TMPDIR, str(uuid4()))
     os.makedirs(uuid_dir)
@@ -56,7 +59,7 @@ async def start_conversion(file: UploadFile = File(...)) -> str:
         while content := await file.read(1024):
             await out_file.write(content)
 
-    task = convert_video_task.delay(tmp_file, uuid_dir)
+    task = convert_video_task.delay(tmp_file, uuid_dir, output_format)
 
     return str(task.id)
 
