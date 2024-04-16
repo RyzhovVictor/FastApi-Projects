@@ -21,45 +21,49 @@ celery: Celery = Celery(
 
 ROOTDIR: str = os.path.dirname(os.path.abspath(__file__))
 TMPDIR: str = os.path.join(ROOTDIR, 'tmp')
+os.makedirs(TMPDIR, exist_ok=True)
 SUPPORTED_FORMATS = ['mp4', 'avi', 'mkv', 'mov', 'webm', 'flv', 'wmv', 'ogv', '3gp', '3g2', 'hevc', 'av1', 'vro']
 
 class DirectoryRequest(BaseModel):
     directory: str
 
-def convert_video(input_file, output_dir, output_format='mp4'):
-    output_file = os.path.splitext(os.path.basename(input_file))[0] + f'_converted.{output_format}'
-    output_path = os.path.join(output_dir, output_file)
-    command = ['ffmpeg', '-i', input_file, '-c:v', 'copy', '-c:a', 'aac', '-strict', 'experimental', output_path]
+def convert_video(tmp_file, new_file):
+    output_path = os.path.join(TMPDIR, new_file)
+    input_path = os.path.join(TMPDIR, tmp_file)
+    command = ['ffmpeg', '-i', input_path, '-c:v', 'copy', '-c:a', 'aac', '-strict', 'experimental', output_path]
     result = subprocess.Popen(command, stdout=subprocess.PIPE)
     output, error = result.communicate()
     if result.returncode != 0:
         raise Exception('Ошибка конвертации')
     else:
-        return output_file
+        return new_file
 
 @celery.task
-def convert_video_task(file_path, output_dir, output_format='mp4'):
-    return convert_video(file_path, output_dir, output_format)
+def convert_video_task(tmp_file, new_file):
+    return convert_video(tmp_file, new_file)
 
 @celery.task
 def delete_files_task(directory_path):
+    directory_path = os.path.join(TMPDIR, directory_path)
     shutil.rmtree(directory_path)
 
 @app.post("/convert-video/")
 async def start_conversion(file: UploadFile = File(...), output_format: str = 'mp4') -> str:
     if output_format not in SUPPORTED_FORMATS:
         raise HTTPException(status_code=400, detail=f"Неподдерживаемый формат. Доступные форматы: {', '.join(SUPPORTED_FORMATS)}")
-    os.makedirs(TMPDIR, exist_ok=True)
-    uuid_dir = os.path.join(TMPDIR, str(uuid4()))
-    os.makedirs(uuid_dir)
+
+    uuid_dir = str(uuid4())
+    os.makedirs(os.path.join(TMPDIR, uuid_dir))
 
     tmp_file: str = os.path.join(uuid_dir, file.filename)
     
-    async with aiofiles.open(tmp_file, 'wb') as out_file:
+    async with aiofiles.open(os.path.join(TMPDIR, tmp_file), 'wb') as out_file:
         while content := await file.read(1024):
             await out_file.write(content)
-
-    task = convert_video_task.delay(tmp_file, uuid_dir, output_format)
+    new_file = os.path.splitext(os.path.basename(file.filename))[0] + f'_converted.{output_format}'
+    new_file = os.path.join(uuid_dir, new_file)
+    print(tmp_file, new_file)
+    task = convert_video_task.delay(tmp_file, new_file)
 
     return str(task.id)
 
@@ -74,16 +78,20 @@ async def get_task_result(task_id: str):
     return task.get()
 
 @app.get("/download-video/") 
-async def download_video(file_name: str) -> FileResponse:
-    for root, dirs, files in os.walk(TMPDIR):
-        if file_name in files:
-            uuid_dir = root
-            break
+async def download_video(task_id: str) -> FileResponse:
+    task = result.AsyncResult(task_id)
+    if task.state == "SUCCESS":
+        output_file = task.result
+        file_path = os.path.join(TMPDIR, output_file)
+        
+        if os.path.exists(file_path):
+            response = FileResponse(path=file_path, filename=output_file.split("/")[1])
+            delete_files_task.apply_async(countdown=60, args=[output_file.split("/")[0]]) 
+            return response
+        else:
+            raise HTTPException(status_code=404, detail="Файл не найден")
     else:
-        raise HTTPException(status_code=404, detail="Файл не найден")
+        raise HTTPException(status_code=400, detail="Файл не готов для скачивания")
 
-    file_path: str = os.path.join(uuid_dir, file_name) 
-    response = FileResponse(path=file_path, filename=file_name)
-    delete_files_task.apply_async(countdown=60, args=[uuid_dir]) 
-    return response
+
 
