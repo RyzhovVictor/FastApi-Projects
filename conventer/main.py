@@ -1,10 +1,11 @@
 import os
 import asyncio
-from celery import Celery
+import shutil
+from uuid import UUID, uuid4
+from celery import Celery, result
 from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse
-
 import aiofiles
 import subprocess
 
@@ -13,59 +14,84 @@ app: FastAPI = FastAPI()
 celery: Celery = Celery(
     'tasks',
     broker='redis://localhost:6379/0',
-    backend='redis://localhost:6379/1'
+    backend='redis://localhost:6379/0',
+    broker_connection_retry_on_startup=True,
+    result_backend='redis://localhost:6379/0'
 )
 
 ROOTDIR: str = os.path.dirname(os.path.abspath(__file__))
 TMPDIR: str = os.path.join(ROOTDIR, 'tmp')
+os.makedirs(TMPDIR, exist_ok=True)
+SUPPORTED_FORMATS = ['mp4', 'avi', 'mkv', 'mov', 'webm', 'flv', 'wmv', 'ogv', '3gp', '3g2', 'hevc', 'av1', 'vro']
 
 class DirectoryRequest(BaseModel):
     directory: str
 
-def convert_vro_to_mp4(input_file, output_file):
-    command = ['ffmpeg', '-i', input_file, '-c:v', 'copy', '-c:a', 'aac', '-strict', 'experimental', output_file]
+def convert_video(tmp_file, new_file):
+    output_path = os.path.join(TMPDIR, new_file)
+    input_path = os.path.join(TMPDIR, tmp_file)
+    command = ['ffmpeg', '-i', input_path, '-c:v', 'copy', '-c:a', 'aac', '-strict', 'experimental', output_path]
     result = subprocess.Popen(command, stdout=subprocess.PIPE)
     output, error = result.communicate()
     if result.returncode != 0:
-        print(f"Ошибка при выполнении команды: {error}")
+        raise Exception('Ошибка конвертации')
     else:
-        print(f"Результат выполнения команды: {output}")
-
-
-def convert_files_in_dir(directory: str) -> None:
-    for root, _, files in os.walk(directory):
-        for file in files:
-            if file.endswith('.VRO'):
-                vro_file: str = os.path.join(root, file)
-                mp4_file: str = os.path.join(root, f"{file[:-4]}.mp4")
-
-                try:
-                    convert_vro_to_mp4(vro_file, mp4_file)
-                    os.remove(vro_file)
-                except Exception as e:
-                    raise HTTPException(status_code=500, detail=f"Ошибка конвертации файла {vro_file}: {str(e)}")
+        return new_file
 
 @celery.task
-def convert_video_task(directory: str) -> None:
-    convert_files_in_dir(directory)
+def convert_video_task(tmp_file, new_file):
+    return convert_video(tmp_file, new_file)
+
+@celery.task
+def delete_files_task(directory_path):
+    directory_path = os.path.join(TMPDIR, directory_path)
+    shutil.rmtree(directory_path)
 
 @app.post("/convert-video/")
-async def start_conversion(file: UploadFile = File(...)) -> dict:
-    os.makedirs(TMPDIR, exist_ok=True)
-    tmp_file: str = os.path.join(TMPDIR, file.filename)
+async def start_conversion(file: UploadFile = File(...), output_format: str = 'mp4') -> str:
+    if output_format not in SUPPORTED_FORMATS:
+        raise HTTPException(status_code=400, detail=f"Неподдерживаемый формат. Доступные форматы: {', '.join(SUPPORTED_FORMATS)}")
 
-    async with aiofiles.open(tmp_file, 'wb') as out_file:
+    uuid_dir = str(uuid4())
+    os.makedirs(os.path.join(TMPDIR, uuid_dir))
+
+    tmp_file: str = os.path.join(uuid_dir, file.filename)
+    
+    async with aiofiles.open(os.path.join(TMPDIR, tmp_file), 'wb') as out_file:
         while content := await file.read(1024):
             await out_file.write(content)
+    new_file = os.path.splitext(os.path.basename(file.filename))[0] + f'_converted.{output_format}'
+    new_file = os.path.join(uuid_dir, new_file)
+    print(tmp_file, new_file)
+    task = convert_video_task.delay(tmp_file, new_file)
 
-    convert_video_task.delay(TMPDIR)
+    return str(task.id)
 
-    return {"message": "Процесс конвертации запущен"}
+@app.get('/task/status/{task_id}')
+async def get_task_status(task_id: str):
+    task = result.AsyncResult(task_id)
+    return task.status
+
+@app.get('/task/result/{task_id}')
+async def get_task_result(task_id: str):
+    task = result.AsyncResult(task_id)
+    return task.get()
 
 @app.get("/download-video/") 
-async def download_video(file_name: str) -> FileResponse:
-    file_path: str = os.path.join(TMPDIR, file_name) 
-    if os.path.exists(file_path):
-        return FileResponse(path=file_path, filename=file_name) 
+async def download_video(task_id: str) -> FileResponse:
+    task = result.AsyncResult(task_id)
+    if task.state == "SUCCESS":
+        output_file = task.result
+        file_path = os.path.join(TMPDIR, output_file)
+        
+        if os.path.exists(file_path):
+            response = FileResponse(path=file_path, filename=output_file.split("/")[1])
+            delete_files_task.apply_async(countdown=60, args=[output_file.split("/")[0]]) 
+            return response
+        else:
+            raise HTTPException(status_code=404, detail="Файл не найден")
     else:
-        raise HTTPException(status_code=404, detail="Файл не найден")
+        raise HTTPException(status_code=400, detail="Файл не готов для скачивания")
+
+
+
